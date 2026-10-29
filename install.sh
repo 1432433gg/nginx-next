@@ -39,7 +39,7 @@ REPO_RAW=https://raw.githubusercontent.com/1432433gg/nginx-next/main
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
 TEMPLATES="nginx/stream-rule.conf nginx/stream-rule-domain.conf chrony/google.conf apt/archive.list"
 # 后端填域名时，Nginx 用这两个 DNS 服务器定时重新解析
-RESOLVERS="1.1.1.1 8.8.8.8"
+RESOLVERS="8.8.8.8 1.1.1.1"
 TEMPLATE_DIR=""
 
 # ─── 输出 ───

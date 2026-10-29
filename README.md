@@ -49,7 +49,7 @@ wget -N https://raw.githubusercontent.com/1432433gg/nginx-next/main/install.sh &
 
 - 一条规则一个文件：`/etc/nginx/stream.d/本机端口.conf`，TCP 和 UDP 都转发
 - 添加时会检查本机端口有没有被占用、有没有重复的规则；写好后先 `nginx -t` 检查，通过才重新加载，不通过就删掉这条恢复原样
-- 后端可以填 IPv4 地址或域名。填域名时 Nginx 每 60 秒重新解析一次（DNS 用 1.1.1.1 和 8.8.8.8，只取 IPv4），域名的 IP 变了会自动跟上
+- 后端可以填 IPv4 地址或域名。填域名时 Nginx 每 60 秒重新解析一次（DNS 用 8.8.8.8 和 1.1.1.1，只取 IPv4），域名的 IP 变了会自动跟上
 - 只用 IPv4：本机只监听 IPv4，后端也只走 IPv4
 - 要改一条规则，删掉再加
 
