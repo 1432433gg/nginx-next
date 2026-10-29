@@ -75,6 +75,7 @@ nginx/stream-rule.conf         转发规则模板（后端是 IP）
 nginx/stream-rule-domain.conf  转发规则模板（后端是域名）
 chrony/google.conf             谷歌时间服务器
 apt/archive.list               Debian 10 / 11 的归档软件源
+LICENSE                        MIT 许可证
 ```
 
 模板里的 `{{PORT}}`、`{{TARGET}}` 等在添加规则时自动填入。只下载 `install.sh` 运行时，脚本会从本仓库下载这些文件。
@@ -87,3 +88,7 @@ apt/archive.list               Debian 10 / 11 的归档软件源
 | `/etc/nginx/stream.d/` | 转发规则，一条一个文件 |
 | `/etc/apt/sources.list.d/nginx.list` | nginx.org 软件源 |
 | `/etc/apt/preferences.d/99nginx` | 优先使用 nginx.org 的包 |
+
+## 许可证
+
+[MIT](LICENSE)
