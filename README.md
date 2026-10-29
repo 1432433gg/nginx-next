@@ -88,7 +88,3 @@ LICENSE                        MIT 许可证
 | `/etc/nginx/stream.d/` | 转发规则，一条一个文件 |
 | `/etc/apt/sources.list.d/nginx.list` | nginx.org 软件源 |
 | `/etc/apt/preferences.d/99nginx` | 优先使用 nginx.org 的包 |
-
-## 许可证
-
-[MIT](LICENSE)
