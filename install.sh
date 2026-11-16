@@ -7,7 +7,7 @@
 #   wget -N https://raw.githubusercontent.com/1432433gg/nginx-next/main/install.sh && chmod +x install.sh && ./install.sh
 #
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 # ─── 路径 ───
 NGINX_BIN=/usr/sbin/nginx
@@ -15,6 +15,9 @@ NGINX_CONF_DIR=/etc/nginx
 NGINX_CONF=$NGINX_CONF_DIR/nginx.conf
 # 每条转发一个文件：/etc/nginx/stream.d/本机端口.conf
 STREAM_DIR=$NGINX_CONF_DIR/stream.d
+TRAFFIC_DIR=/var/lib/nginx-next/traffic
+TRAFFIC_GUARD=/usr/local/lib/nginx-next/traffic-guard.sh
+SYSTEMD_DIR=/etc/systemd/system
 
 # nginx.org 官方源（稳定版）
 NGINX_KEY_URL=https://nginx.org/keys/nginx_signing.key
@@ -34,10 +37,20 @@ EOL_CODENAMES="buster bullseye"
 # nginx.org 还在正式支持的系统，其他的（Debian 10 / 11、Ubuntu 20.04）只能装到它最后出的版本
 NGINX_OFFICIAL_CODENAMES="bookworm trixie jammy noble resolute"
 
-# 配置文件模板放在仓库的各个目录里；只下载了 install.sh 时，运行时从 GitHub 下载
+# 配套文件按用途放在各个目录里；只下载了 install.sh 时，运行时从 GitHub 下载
 REPO_RAW=https://raw.githubusercontent.com/1432433gg/nginx-next/main
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)
-TEMPLATES="nginx/stream-rule.conf nginx/stream-rule-domain.conf chrony/google.conf apt/archive.list"
+TEMPLATES="
+nginx/stream-rule.conf
+nginx/stream-rule-domain.conf
+chrony/google.conf
+apt/archive.list
+traffic/guard.sh
+systemd/nginx-next-traffic.service
+systemd/nginx-next-traffic-monthly.service
+systemd/nginx-next-traffic-monthly.timer
+systemd/nginx-traffic.conf
+"
 # 后端填域名时，Nginx 用这两个 DNS 服务器定时重新解析
 RESOLVERS="8.8.8.8 1.1.1.1"
 TEMPLATE_DIR=""
@@ -240,7 +253,7 @@ apt_update() {
 install_deps() {
   print_info "安装依赖"
   apt_update || exit 1
-  apt_install wget curl lsof gnupg ca-certificates chrony
+  apt_install wget curl lsof gnupg ca-certificates chrony iproute2 util-linux
   judge "安装依赖"
 }
 
@@ -422,7 +435,20 @@ check_nginx_config() {
 
 # 在运行就重新加载，没在运行就启动
 reload_nginx() {
+  local summary
+  NGINX_QUOTA_PAUSED=0
   check_nginx_config || return 1
+  if traffic_enabled; then
+    [[ -x $TRAFFIC_GUARD ]] || { print_error "流量监控文件缺失"; return 1; }
+    "$TRAFFIC_GUARD" tick || return 1
+    summary=$("$TRAFFIC_GUARD" status) || return 1
+    if [[ $summary == *'blocked=1'* ]]; then
+      NGINX_QUOTA_PAUSED=1
+      print_warn "本月额度用尽，转发已暂停"
+      return 0
+    fi
+    "$TRAFFIC_GUARD" check-start || return 1
+  fi
   systemctl enable nginx >/dev/null 2>&1
   if systemctl is-active --quiet nginx; then
     systemctl reload nginx
@@ -447,6 +473,7 @@ nginx_listen_ports() {
 # 自检：Nginx 只能监听转发规则里的端口，不能开 80
 check_listen() {
   local ports port
+  [[ ${NGINX_QUOTA_PAUSED:-0} == 1 ]] && return 0
   ports=$(nginx_listen_ports)
   # 转发规则本身用了 80 端口就不算（那是转发，不是网页）
   if grep -qw 80 <<<"$ports" && [[ ! -f $STREAM_DIR/80.conf ]]; then
@@ -655,6 +682,10 @@ add_rule() {
     return 1
   fi
   reload_nginx || return 1
+  if [[ ${NGINX_QUOTA_PAUSED:-0} == 1 ]]; then
+    print_ok "已保存转发：本机 $LOCAL_PORT → $TARGET:$TARGET_PORT（TCP + UDP）"
+    return 0
+  fi
   if ! grep -qw "$LOCAL_PORT" <<<"$(nginx_listen_ports)"; then
     print_error "Nginx 没有监听端口 $LOCAL_PORT，可能刚被别的程序占用了"
     return 1
@@ -730,7 +761,184 @@ install_nginx() {
   echo
 }
 
-# ─── 6. 服务状态 ───
+# ─── 6. 流量统计 ───
+traffic_enabled() {
+  [[ -f $TRAFFIC_DIR/state || -e $TRAFFIC_GUARD || -f $SYSTEMD_DIR/nginx.service.d/traffic.conf ]]
+}
+
+# 小数最多九位，使用整数运算换算为字节，避免浮点累计误差。
+traffic_gb_to_bytes() {
+  local value=$1 whole fraction
+  [[ $value =~ ^[0-9]{1,6}([.][0-9]{1,9})?$ ]] || return 1
+  whole=${value%%.*}
+  fraction=0
+  [[ $value != *.* ]] || fraction=${value#*.}
+  fraction=${fraction}000000000
+  fraction=${fraction:0:9}
+  TRAFFIC_INPUT_BYTES=$((10#$whole * 1000000000 + 10#$fraction))
+}
+
+read_traffic_value() {
+  local label=$1 kind=$2 input
+  while true; do
+    read -rp "$label（GB）：" input || return 1
+    input=${input:-0}
+    if traffic_gb_to_bytes "$input"; then
+      if [[ $kind == limit && $TRAFFIC_INPUT_BYTES == 0 ]]; then
+        TRAFFIC_INPUT_BYTES=1000000000
+      fi
+      return 0
+    fi
+    print_error "请输入有效数值"
+  done
+}
+
+traffic_format_gb() {
+  awk -v bytes="$1" 'BEGIN {printf "%.2f", bytes / 1000000000}'
+}
+
+traffic_interface() {
+  local interface
+  interface=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+  if [[ ! $interface =~ ^[a-zA-Z0-9_.:-]{1,15}$ || $interface == lo ||
+        ! -r /sys/class/net/$interface/statistics/tx_bytes ]]; then
+    print_error "无法识别出口网卡"
+    return 1
+  fi
+  TRAFFIC_INTERFACE=$interface
+}
+
+traffic_install_file() {
+  local source=$1 destination=$2 mode=$3 tmp
+  mkdir -p "$(dirname "$destination")" || return 1
+  tmp=$(mktemp "${destination}.XXXXXX") || return 1
+  if ! install -m "$mode" "$source" "$tmp" || ! mv -f "$tmp" "$destination"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+traffic_install_components() {
+  local staging name
+  prepare_templates || return 1
+  bash -n "$TEMPLATE_DIR/traffic/guard.sh" || return 1
+  staging=$(mktemp -d) || return 1
+  for name in nginx-next-traffic.service nginx-next-traffic-monthly.service nginx-next-traffic-monthly.timer nginx-traffic.conf; do
+    if ! render_template "systemd/$name" "$staging/$name" GUARD="$TRAFFIC_GUARD"; then
+      rm -rf "$staging"
+      return 1
+    fi
+  done
+  if ! traffic_install_file "$TEMPLATE_DIR/traffic/guard.sh" "$TRAFFIC_GUARD" 755; then
+    rm -rf "$staging"
+    return 1
+  fi
+  for name in nginx-next-traffic.service nginx-next-traffic-monthly.service nginx-next-traffic-monthly.timer; do
+    if ! traffic_install_file "$staging/$name" "$SYSTEMD_DIR/$name" 644; then
+      rm -rf "$staging"
+      return 1
+    fi
+  done
+  if ! traffic_install_file "$staging/nginx-traffic.conf" "$SYSTEMD_DIR/nginx.service.d/traffic.conf" 644; then
+    rm -rf "$staging"
+    return 1
+  fi
+  rm -rf "$staging"
+  systemctl daemon-reload || return 1
+  systemctl enable --now nginx-next-traffic.service nginx-next-traffic-monthly.timer >/dev/null || return 1
+  systemctl restart nginx-next-traffic.service || return 1
+  printf '%s\n' "$SCRIPT_VERSION" >"$TRAFFIC_DIR/component-version" || return 1
+  "$TRAFFIC_GUARD" tick
+}
+
+traffic_update_components() {
+  local version
+  traffic_enabled || return 0
+  version=$(cat "$TRAFFIC_DIR/component-version" 2>/dev/null)
+  if [[ $version != "$SCRIPT_VERSION" || ! -x $TRAFFIC_GUARD ||
+        ! -f $SYSTEMD_DIR/nginx.service.d/traffic.conf ||
+        ! -f $SYSTEMD_DIR/nginx-next-traffic-monthly.timer ||
+        ! -f $SYSTEMD_DIR/nginx-next-traffic-monthly.service ||
+        ! -f $SYSTEMD_DIR/nginx-next-traffic.service ]]; then
+    traffic_install_components
+  fi
+}
+
+traffic_setup() {
+  local limit used
+  read_traffic_value "流量上限" limit || return 1
+  limit=$TRAFFIC_INPUT_BYTES
+  read_traffic_value "已用流量" used || return 1
+  used=$TRAFFIC_INPUT_BYTES
+  traffic_interface || return 1
+  prepare_templates || return 1
+  NGINX_NEXT_TRAFFIC_DIR=$TRAFFIC_DIR bash "$TEMPLATE_DIR/traffic/guard.sh" init "$TRAFFIC_INTERFACE" "$limit" "$used" || return 1
+  traffic_install_components || return 1
+}
+
+traffic_show() {
+  local summary key value used= limit= blocked= remaining state
+  summary=$("$TRAFFIC_GUARD" status) || return 1
+  while IFS='=' read -r key value; do
+    case "$key" in
+      used) used=$value ;;
+      limit) limit=$value ;;
+      blocked) blocked=$value ;;
+    esac
+  done <<<"$summary"
+  [[ $used =~ ^[0-9]+$ && $limit =~ ^[0-9]+$ && $blocked =~ ^[01]$ ]] || return 1
+  remaining=$((limit - used))
+  ((remaining >= 0)) || remaining=0
+  if systemctl is-active --quiet nginx; then
+    state=运行中
+  elif [[ $blocked == 1 ]]; then
+    state='已停止（本月额度用尽）'
+  else
+    state=未运行
+  fi
+  echo
+  echo '—————— 流量统计 ——————'
+  echo
+  printf '已用流量：%s GB\n' "$(traffic_format_gb "$used")"
+  printf '流量上限：%s GB\n' "$(traffic_format_gb "$limit")"
+  printf '剩余流量：%s GB\n' "$(traffic_format_gb "$remaining")"
+  printf 'Nginx状态：%s\n' "$state"
+  echo
+  echo '1.  重置流量'
+  echo '2.  设置流量上限'
+  echo '3.  设置已用流量'
+  echo '0.  返回主菜单'
+  echo
+}
+
+traffic_menu() {
+  local choice
+  require_installed || return 1
+  if ! traffic_enabled; then
+    traffic_setup || return 1
+  else
+    traffic_update_components || return 1
+  fi
+  while true; do
+    traffic_show || { print_error "读取流量统计失败"; return 1; }
+    read -rp '请输入数字：' choice || return 0
+    case "$choice" in
+      1) "$TRAFFIC_GUARD" reset || print_error "重置失败" ;;
+      2)
+        read_traffic_value "流量上限" limit || return 0
+        "$TRAFFIC_GUARD" set-limit "$TRAFFIC_INPUT_BYTES" || print_error "设置失败"
+        ;;
+      3)
+        read_traffic_value "已用流量" used || return 0
+        "$TRAFFIC_GUARD" set-used "$TRAFFIC_INPUT_BYTES" || print_error "设置失败"
+        ;;
+      0) return 0 ;;
+      *) print_error "请输入正确的数字" ;;
+    esac
+  done
+}
+
+# ─── 7. 服务状态 ───
 service_state() {
   if systemctl is-active --quiet "$1"; then
     echo -e "${Green}运行中${Font}"
@@ -768,7 +976,7 @@ show_status() {
   echo
 }
 
-# ─── 7. 更新 Nginx ───
+# ─── 8. 更新 Nginx ───
 update_nginx() {
   local old new installed candidate
   require_installed || return 1
@@ -805,7 +1013,7 @@ update_nginx() {
   check_listen
 }
 
-# ─── 8. 更新 Linux 内核 ───
+# ─── 9. 更新 Linux 内核 ───
 # 已安装的具体版本内核包里，除了新内核和正在运行的内核，其余都删掉
 kernel_packages_to_remove() {
   local new_ver=$1 running=$2 pkg ver
@@ -898,7 +1106,7 @@ update_kernel() {
   fi
 }
 
-# ─── 9. BBR ───
+# ─── 10. BBR ───
 install_bbr() {
   local dir
   dir=$(mktemp -d)
@@ -959,43 +1167,49 @@ update_script() {
 menu() {
   is_root
   detect_system
+  traffic_update_components || return 1
 
-  # 标题缩进 3 格
-  echo -e "   Nginx 端口转发一键脚本 ${Red}[${SCRIPT_VERSION}]${Font}"
-  echo -e "   https://github.com/1432433gg/nginx-next"
-  echo
-  echo -e "—————— 安装 ——————"
-  echo -e "${Green}1.${Font}  安装 Nginx"
-  echo -e "${Green}2.${Font}  升级 脚本"
-  echo -e "—————— 转发规则 ——————"
-  echo -e "${Green}3.${Font}  添加转发"
-  echo -e "${Green}4.${Font}  删除转发"
-  echo -e "${Green}5.${Font}  查看转发"
-  echo -e "—————— 查看信息 ——————"
-  echo -e "${Green}6.${Font}  查看服务运行状态"
-  echo -e "—————— 其他 ——————"
-  echo -e "${Green}7.${Font}  更新 Nginx"
-  if [[ $OS_ID == debian ]]; then
-    echo -e "${Green}8.${Font}  更新 Linux 内核"
-  else
-    echo -e "${Green}8.${Font}  更新 Linux 内核（仅 Debian）"
-  fi
-  echo -e "${Green}9.${Font}  安装 BBR 加速"
-  echo -e "${Green}0.${Font}  退出"
-  read -rp "请输入数字：" menu_num
-  case "$menu_num" in
-    1) install_nginx ;;
-    2) update_script ;;
-    3) add_rule ;;
-    4) del_rule ;;
-    5) show_rules ;;
-    6) show_status ;;
-    7) update_nginx ;;
-    8) update_kernel ;;
-    9) install_bbr ;;
-    0) exit 0 ;;
-    *) print_error "请输入正确的数字" ;;
-  esac
+  while true; do
+
+    # 标题缩进 3 格
+    echo -e "   Nginx 端口转发一键脚本 ${Red}[${SCRIPT_VERSION}]${Font}"
+    echo -e "   https://github.com/1432433gg/nginx-next"
+    echo
+    echo -e "—————— 安装 ——————"
+    echo -e "${Green}1.${Font}  安装 Nginx"
+    echo -e "${Green}2.${Font}  升级 脚本"
+    echo -e "—————— 转发规则 ——————"
+    echo -e "${Green}3.${Font}  添加转发"
+    echo -e "${Green}4.${Font}  删除转发"
+    echo -e "${Green}5.${Font}  查看转发"
+    echo -e "—————— 查看信息 ——————"
+    echo -e "${Green}6.${Font}  流量统计"
+    echo -e "${Green}7.${Font}  查看服务运行状态"
+    echo -e "—————— 其他 ——————"
+    echo -e "${Green}8.${Font}  更新 Nginx"
+    if [[ $OS_ID == debian ]]; then
+      echo -e "${Green}9.${Font}  更新 Linux 内核"
+    else
+      echo -e "${Green}9.${Font}  更新 Linux 内核（仅 Debian）"
+    fi
+    echo -e "${Green}10.${Font} 安装 BBR 加速"
+    echo -e "${Green}0.${Font}  退出"
+    read -rp "请输入数字：" menu_num || return 0
+    case "$menu_num" in
+      1) install_nginx ;;
+      2) update_script ;;
+      3) add_rule ;;
+      4) del_rule ;;
+      5) show_rules ;;
+      6) traffic_menu ;;
+      7) show_status ;;
+      8) update_nginx ;;
+      9) update_kernel ;;
+      10) install_bbr ;;
+      0) exit 0 ;;
+      *) print_error "请输入正确的数字" ;;
+    esac
+  done
 }
 
 # 被 source 时（测试用）不执行菜单

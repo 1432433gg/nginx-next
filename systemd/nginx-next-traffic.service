@@ -1,0 +1,15 @@
+[Unit]
+Description=nginx-next monthly traffic monitor
+After=network.target time-sync.target
+
+[Service]
+Type=simple
+ExecStart={{GUARD}} daemon
+ExecStopPost={{GUARD}} flush
+Restart=always
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

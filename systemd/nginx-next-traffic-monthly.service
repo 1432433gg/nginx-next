@@ -1,0 +1,8 @@
+[Unit]
+Description=nginx-next monthly traffic check
+After=network.target time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart={{GUARD}} tick
+UMask=0077
