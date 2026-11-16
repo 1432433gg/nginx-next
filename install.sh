@@ -7,7 +7,7 @@
 #   wget -N https://raw.githubusercontent.com/1432433gg/nginx-next/main/install.sh && chmod +x install.sh && ./install.sh
 #
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 
 # ─── 路径 ───
 NGINX_BIN=/usr/sbin/nginx
@@ -766,6 +766,19 @@ traffic_enabled() {
   [[ -f $TRAFFIC_DIR/state || -e $TRAFFIC_GUARD || -f $SYSTEMD_DIR/nginx.service.d/traffic.conf ]]
 }
 
+traffic_ensure_deps() {
+  local -a packages=()
+  command -v ip >/dev/null 2>&1 || packages+=(iproute2)
+  command -v flock >/dev/null 2>&1 || packages+=(util-linux)
+  [[ ${#packages[@]} == 0 ]] && return 0
+  print_info "安装流量统计依赖"
+  apt_update || return 1
+  if ! apt_install "${packages[@]}"; then
+    print_error "安装流量统计依赖失败"
+    return 1
+  fi
+}
+
 # 小数最多九位，使用整数运算换算为字节，避免浮点累计误差。
 traffic_gb_to_bytes() {
   local value=$1 whole fraction
@@ -854,6 +867,7 @@ traffic_install_components() {
 traffic_update_components() {
   local version
   traffic_enabled || return 0
+  traffic_ensure_deps || return 1
   version=$(cat "$TRAFFIC_DIR/component-version" 2>/dev/null)
   if [[ $version != "$SCRIPT_VERSION" || ! -x $TRAFFIC_GUARD ||
         ! -f $SYSTEMD_DIR/nginx.service.d/traffic.conf ||
@@ -889,6 +903,11 @@ traffic_show() {
   [[ $used =~ ^[0-9]+$ && $limit =~ ^[0-9]+$ && $blocked =~ ^[01]$ ]] || return 1
   remaining=$((limit - used))
   ((remaining >= 0)) || remaining=0
+  if [[ ${1:-} == inline ]]; then
+    printf '流量统计：已用 %s GB  上限 %s GB  剩余 %s GB\n' \
+      "$(traffic_format_gb "$used")" "$(traffic_format_gb "$limit")" "$(traffic_format_gb "$remaining")"
+    return 0
+  fi
   if systemctl is-active --quiet nginx; then
     state=运行中
   elif [[ $blocked == 1 ]]; then
@@ -907,13 +926,24 @@ traffic_show() {
   echo '1.  重置流量'
   echo '2.  设置流量上限'
   echo '3.  设置已用流量'
-  echo '0.  返回主菜单'
+  echo '0.  退出'
   echo
+}
+
+traffic_status_line() {
+  if ! traffic_enabled; then
+    echo '流量统计：未设置'
+  elif [[ -x $TRAFFIC_GUARD ]] && traffic_show inline 2>/dev/null; then
+    return 0
+  else
+    echo '流量统计：读取失败'
+  fi
 }
 
 traffic_menu() {
   local choice
   require_installed || return 1
+  traffic_ensure_deps || return 1
   if ! traffic_enabled; then
     traffic_setup || return 1
   else
@@ -961,7 +991,8 @@ congestion_state() {
 }
 
 show_status() {
-  local count ports
+  local count ports traffic
+  traffic=$(traffic_status_line)
   count=$(rule_ports | wc -l)
   ports=$(nginx_listen_ports)
   ports=${ports% }
@@ -970,6 +1001,7 @@ show_status() {
   echo -e "转发规则：${count} 条"
   echo -e "监听端口：${ports:-无}"
   echo -e "时间同步：$(service_state chrony)  $(time_sync_state)"
+  echo "$traffic"
   echo -e "当前时间：$(now_time)"
   echo -e "Linux 内核：$(uname -r)"
   echo -e "拥塞控制：$(congestion_state)"
@@ -1169,47 +1201,44 @@ menu() {
   detect_system
   traffic_update_components || return 1
 
-  while true; do
-
-    # 标题缩进 3 格
-    echo -e "   Nginx 端口转发一键脚本 ${Red}[${SCRIPT_VERSION}]${Font}"
-    echo -e "   https://github.com/1432433gg/nginx-next"
-    echo
-    echo -e "—————— 安装 ——————"
-    echo -e "${Green}1.${Font}  安装 Nginx"
-    echo -e "${Green}2.${Font}  升级 脚本"
-    echo -e "—————— 转发规则 ——————"
-    echo -e "${Green}3.${Font}  添加转发"
-    echo -e "${Green}4.${Font}  删除转发"
-    echo -e "${Green}5.${Font}  查看转发"
-    echo -e "—————— 查看信息 ——————"
-    echo -e "${Green}6.${Font}  流量统计"
-    echo -e "${Green}7.${Font}  查看服务运行状态"
-    echo -e "—————— 其他 ——————"
-    echo -e "${Green}8.${Font}  更新 Nginx"
-    if [[ $OS_ID == debian ]]; then
-      echo -e "${Green}9.${Font}  更新 Linux 内核"
-    else
-      echo -e "${Green}9.${Font}  更新 Linux 内核（仅 Debian）"
-    fi
-    echo -e "${Green}10.${Font} 安装 BBR 加速"
-    echo -e "${Green}0.${Font}  退出"
-    read -rp "请输入数字：" menu_num || return 0
-    case "$menu_num" in
-      1) install_nginx ;;
-      2) update_script ;;
-      3) add_rule ;;
-      4) del_rule ;;
-      5) show_rules ;;
-      6) traffic_menu ;;
-      7) show_status ;;
-      8) update_nginx ;;
-      9) update_kernel ;;
-      10) install_bbr ;;
-      0) exit 0 ;;
-      *) print_error "请输入正确的数字" ;;
-    esac
-  done
+  # 标题缩进 3 格
+  echo -e "   Nginx 端口转发一键脚本 ${Red}[${SCRIPT_VERSION}]${Font}"
+  echo -e "   https://github.com/1432433gg/nginx-next"
+  echo
+  echo -e "—————— 安装 ——————"
+  echo -e "${Green}1.${Font}  安装 Nginx"
+  echo -e "${Green}2.${Font}  升级 脚本"
+  echo -e "—————— 转发规则 ——————"
+  echo -e "${Green}3.${Font}  添加转发"
+  echo -e "${Green}4.${Font}  删除转发"
+  echo -e "${Green}5.${Font}  查看转发"
+  echo -e "—————— 查看信息 ——————"
+  echo -e "${Green}6.${Font}  流量统计"
+  echo -e "${Green}7.${Font}  查看服务运行状态"
+  echo -e "—————— 其他 ——————"
+  echo -e "${Green}8.${Font}  更新 Nginx"
+  if [[ $OS_ID == debian ]]; then
+    echo -e "${Green}9.${Font}  更新 Linux 内核"
+  else
+    echo -e "${Green}9.${Font}  更新 Linux 内核（仅 Debian）"
+  fi
+  echo -e "${Green}10.${Font} 安装 BBR 加速"
+  echo -e "${Green}0.${Font}  退出"
+  read -rp "请输入数字：" menu_num || return 0
+  case "$menu_num" in
+    1) install_nginx ;;
+    2) update_script ;;
+    3) add_rule ;;
+    4) del_rule ;;
+    5) show_rules ;;
+    6) traffic_menu ;;
+    7) show_status ;;
+    8) update_nginx ;;
+    9) update_kernel ;;
+    10) install_bbr ;;
+    0) exit 0 ;;
+    *) print_error "请输入正确的数字" ;;
+  esac
 }
 
 # 被 source 时（测试用）不执行菜单

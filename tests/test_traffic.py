@@ -3,6 +3,8 @@
 import concurrent.futures
 import os
 from pathlib import Path
+import re
+import shutil
 import signal
 import subprocess
 import tempfile
@@ -56,6 +58,20 @@ else:
     os.execv('/usr/bin/date',['date']+sys.argv[1:])
 '''
 
+WGET = r'''#!/usr/bin/env python3
+import os, pathlib, shutil, sys
+args=sys.argv[1:]
+prefix='https://raw.githubusercontent.com/1432433gg/nginx-next/main/'
+url=args[-1]
+if not url.startswith(prefix) or '-O' not in args: sys.exit(1)
+relative=url[len(prefix):]
+source=pathlib.Path(os.environ['FAKE_RELEASE_ROOT'])/relative
+if not source.is_file(): sys.exit(1)
+destination=pathlib.Path(args[args.index('-O')+1])
+shutil.copyfile(source,destination)
+with open(os.environ['FAKE_DOWNLOAD_LOG'],'a') as f: f.write(relative+'\n')
+'''
+
 
 class TrafficTests(unittest.TestCase):
     def setUp(self):
@@ -65,7 +81,8 @@ class TrafficTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        for name, body in [('systemctl', SYSTEMCTL), ('nginx', NGINX), ('date', DATE)]:
+        for name, body in [('systemctl', SYSTEMCTL), ('nginx', NGINX), ('date', DATE),
+                           ('ip', '#!/usr/bin/env bash\nprintf "1.1.1.1 dev eth0 src 192.0.2.1\\n"\n')]:
             path = self.bin / name
             path.write_text(body)
             path.chmod(0o755)
@@ -133,6 +150,121 @@ NGINX_BIN=$NGINX_NEXT_NGINX_BIN
         else:
             self.assertNotEqual(result.returncode, 0, result.stdout)
         return result
+
+    def run_script_upgrade(self, configured=False, over_quota=False, old_version='1.0.4'):
+        client = self.root/'client'
+        client.mkdir()
+        rules = client/'rules'
+        rules.mkdir()
+        rule = rules/'10000.conf'
+        original_rule = b'server {\n    listen 10000;\n    proxy_pass 1.2.3.4:443;\n}\n'
+        rule.write_bytes(original_rule)
+        if configured:
+            self.init(limit=500*GB, used=(501 if over_quota else 123)*GB)
+            self.shell('traffic_install_components', installed=True)
+            (self.state_dir/'component-version').write_text('1.0.4\n')
+
+        hook = '''
+TRAFFIC_DIR=$NGINX_NEXT_TRAFFIC_DIR
+TRAFFIC_GUARD=$FAKE_INSTALLED_GUARD
+SYSTEMD_DIR=$FAKE_SYSTEMD_DIR
+STREAM_DIR=$FAKE_STREAM_DIR
+NGINX_BIN=$NGINX_NEXT_NGINX_BIN
+is_root() { :; }
+detect_system() { OS_ID=debian; }
+nginx_listen_ports() { :; }
+time_sync_state() { echo 已同步; }
+congestion_state() { echo bbr; }
+'''
+        def isolated_source(text):
+            self.assertIn('# 被 source 时', text)
+            return text.replace('# 被 source 时', hook+'\n# 被 source 时', 1)
+
+        release = self.root/'release'
+        release.mkdir()
+        for directory in ['nginx', 'chrony', 'apt', 'traffic', 'systemd']:
+            shutil.copytree(REPO/directory, release/directory)
+        (release/'install.sh').write_text(isolated_source(INSTALL.read_text()))
+
+        old_script_env = 'NGINX_NEXT_TEST_OLD_SCRIPT_103' if old_version == '1.0.3' else 'NGINX_NEXT_TEST_OLD_SCRIPT'
+        old_source = Path(os.environ.get(old_script_env, str(INSTALL))).read_text()
+        old_source = re.sub(r'^SCRIPT_VERSION="[^"]+"$', f'SCRIPT_VERSION="{old_version}"', old_source, flags=re.M)
+        old_script = client/'install.sh'
+        old_script.write_text(isolated_source(old_source))
+        old_script.chmod(0o755)
+        wget = self.bin/'wget'
+        wget.write_text(WGET)
+        wget.chmod(0o755)
+        download_log = self.root/'downloads'
+        env = dict(self.env, FAKE_RELEASE_ROOT=str(release), FAKE_DOWNLOAD_LOG=str(download_log),
+                   FAKE_INSTALLED_GUARD=str(self.root/'installed/traffic-guard.sh'),
+                   FAKE_SYSTEMD_DIR=str(self.root/'systemd'), FAKE_STREAM_DIR=str(rules))
+        result = subprocess.run(['bash', str(old_script)], input='2\n7\n', env=env,
+                                text=True, capture_output=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr+'\n'+result.stdout)
+        self.assertIn(f'已从 {old_version} 升级到 1.0.5', result.stdout)
+        self.assertEqual(result.stdout.count('Nginx 端口转发一键脚本'), 2)
+        self.assertIn('SCRIPT_VERSION="1.0.5"', old_script.read_text())
+        self.assertEqual(rule.read_bytes(), original_rule)
+        downloads = download_log.read_text().splitlines()
+        self.assertEqual(downloads[0], 'install.sh')
+        if configured:
+            self.assertEqual(self.state()['limit'], str(500*GB))
+            self.assertEqual(self.used(), (501 if over_quota else 123)*GB)
+            self.assertEqual((self.state_dir/'component-version').read_text().strip(), '1.0.5')
+            self.assertEqual((self.root/'installed/traffic-guard.sh').read_bytes(), GUARD.read_bytes())
+            self.assertIn('traffic/guard.sh', downloads)
+            self.assertIn('systemd/nginx-next-traffic-monthly.timer', downloads)
+        else:
+            self.assertFalse(self.state_dir.exists())
+            self.assertEqual(downloads, ['install.sh'])
+        return result
+
+    def test_upgrade_from_104_preserves_traffic_settings_and_rules(self):
+        result = self.run_script_upgrade(configured=True)
+        self.assertTrue(self.active())
+        self.assertIn('流量统计：已用 123.00 GB  上限 500.00 GB  剩余 377.00 GB', result.stdout)
+        calls = (self.control/'calls').read_text().splitlines()
+        self.assertNotIn('stop nginx', calls)
+        self.assertNotIn('restart nginx', calls)
+
+    def test_upgrade_from_104_does_not_restart_over_quota_nginx(self):
+        result = self.run_script_upgrade(configured=True, over_quota=True)
+        self.assertFalse(self.active())
+        self.assertEqual(self.state()['blocked'], '1')
+        self.assertIn('流量统计：已用 501.00 GB  上限 500.00 GB  剩余 0.00 GB', result.stdout)
+        self.assertNotIn('start nginx', (self.control/'calls').read_text().splitlines())
+
+    def test_upgrade_from_104_without_traffic_setup_does_not_prompt_or_initialize(self):
+        result = self.run_script_upgrade()
+        self.assertIn('流量统计：未设置', result.stdout)
+        self.assertNotIn('流量上限（GB）', result.stdout)
+        self.assertTrue(self.active())
+
+    def test_upgrade_from_103_preserves_rules_and_supports_new_status_page(self):
+        result = self.run_script_upgrade(old_version='1.0.3')
+        self.assertIn('流量统计：未设置', result.stdout)
+        self.assertTrue(self.active())
+
+    def test_missing_traffic_dependencies_are_installed(self):
+        result = self.shell('''
+command() {
+  if [[ $1 == -v && ( $2 == ip || $2 == flock ) ]]; then return 1; fi
+  builtin command "$@"
+}
+apt_update() { echo APT_UPDATE; }
+apt_install() { printf 'APT_INSTALL:%s\n' "$*"; }
+traffic_ensure_deps
+''')
+        self.assertIn('APT_UPDATE', result.stdout)
+        self.assertIn('APT_INSTALL:iproute2 util-linux', result.stdout)
+
+    def test_existing_traffic_dependencies_do_not_trigger_package_install(self):
+        result = self.shell('''
+apt_update() { echo UNEXPECTED_APT; return 1; }
+traffic_ensure_deps
+''')
+        self.assertEqual(result.stdout, '')
 
     def test_initial_counter_is_baseline_and_imported_usage_is_kept(self):
         self.init(used=700)
@@ -383,21 +515,128 @@ NGINX_BIN=$NGINX_NEXT_NGINX_BIN
         self.assertIn('已停止（本月额度用尽）', result.stdout)
 
     def test_main_menu_order_and_dispatch(self):
-        result = self.shell('''
+        body = '''
 is_root() { :; }
 detect_system() { OS_ID=debian; }
 traffic_update_components() { :; }
+install_nginx() { echo ACTION_INSTALL; }
+update_script() { echo ACTION_SCRIPT; }
+add_rule() { echo ACTION_ADD; }
+del_rule() { echo ACTION_DELETE; }
+show_rules() { echo ACTION_RULES; }
 traffic_menu() { echo ACTION_TRAFFIC; }
 show_status() { echo ACTION_STATUS; }
 update_nginx() { echo ACTION_UPDATE; }
 update_kernel() { echo ACTION_KERNEL; }
 install_bbr() { echo ACTION_BBR; }
 menu
-''', '6\n7\n8\n9\n10\n0\n')
-        for text in ['6.','流量统计','7.','查看服务运行状态','8.','更新 Nginx','9.','更新 Linux 内核','10.']:
-            self.assertIn(text, result.stdout)
-        actions = [line for line in result.stdout.splitlines() if line.startswith('ACTION_')]
-        self.assertEqual(actions, ['ACTION_TRAFFIC','ACTION_STATUS','ACTION_UPDATE','ACTION_KERNEL','ACTION_BBR'])
+echo SHELL_RETURNED
+'''
+        expected = ['INSTALL', 'SCRIPT', 'ADD', 'DELETE', 'RULES', 'TRAFFIC',
+                    'STATUS', 'UPDATE', 'KERNEL', 'BBR']
+        for choice, action in enumerate(expected, 1):
+            with self.subTest(choice=choice):
+                result = self.shell(body, f'{choice}\n7\n')
+                for text in ['6.','流量统计','7.','查看服务运行状态','8.','更新 Nginx','9.','更新 Linux 内核','10.']:
+                    self.assertIn(text, result.stdout)
+                actions = [line for line in result.stdout.splitlines() if line.startswith('ACTION_')]
+                self.assertEqual(actions, ['ACTION_'+action])
+                self.assertEqual(result.stdout.count('Nginx 端口转发一键脚本'), 1)
+                self.assertTrue(result.stdout.rstrip().endswith('SHELL_RETURNED'))
+
+    def test_service_status_displays_traffic_after_time_sync_and_exits(self):
+        self.init(limit=500*GB, used=63_200_000_000)
+        result = self.shell('''
+is_root() { :; }
+detect_system() { OS_ID=debian; }
+traffic_update_components() { :; }
+service_state() { echo 运行中; }
+nginx_version() { echo 1.30.5; }
+rule_ports() { echo 10000; }
+nginx_listen_ports() { echo 10000; }
+time_sync_state() { echo 已同步; }
+congestion_state() { echo bbr; }
+show_rules() { echo SECOND_ACTION_SHOULD_NOT_RUN; }
+menu
+echo SHELL_RETURNED
+''', '7\n5\n')
+        lines = result.stdout.splitlines()
+        time_index = lines.index('时间同步：运行中  已同步')
+        self.assertEqual(lines[time_index+1], '流量统计：已用 63.20 GB  上限 500.00 GB  剩余 436.80 GB')
+        self.assertTrue(lines[time_index+2].startswith('当前时间：'))
+        self.assertEqual(result.stdout.count('Nginx 端口转发一键脚本'), 1)
+        self.assertNotIn('SECOND_ACTION_SHOULD_NOT_RUN', result.stdout)
+        self.assertTrue(result.stdout.rstrip().endswith('SHELL_RETURNED'))
+
+    def test_service_status_does_not_initialize_unconfigured_traffic(self):
+        result = self.shell('''
+service_state() { echo 运行中; }
+nginx_version() { echo 1.30.5; }
+rule_ports() { :; }
+nginx_listen_ports() { :; }
+time_sync_state() { echo 已同步; }
+congestion_state() { echo bbr; }
+show_status
+''', installed=True)
+        self.assertIn('流量统计：未设置', result.stdout)
+        self.assertNotIn('流量上限（GB）', result.stdout)
+        self.assertFalse(self.state_dir.exists())
+        self.assertEqual((self.control/'calls').read_text(), '')
+
+    def test_service_status_samples_quota_before_reporting_nginx_state(self):
+        self.init(limit=500*GB, used=501*GB)
+        result = self.shell('''
+service_state() {
+  if systemctl is-active --quiet "$1"; then echo 运行中; else echo 未运行; fi
+}
+nginx_version() { echo 1.30.5; }
+rule_ports() { :; }
+nginx_listen_ports() {
+  if systemctl is-active --quiet nginx; then echo 10000; fi
+}
+time_sync_state() { echo 已同步; }
+congestion_state() { echo bbr; }
+show_status
+''')
+        self.assertIn('Nginx：未运行  1.30.5', result.stdout)
+        self.assertIn('监听端口：无', result.stdout)
+        self.assertIn('流量统计：已用 501.00 GB  上限 500.00 GB  剩余 0.00 GB', result.stdout)
+        self.assertFalse(self.active())
+
+    def test_show_rules_returns_to_shell_without_reading_another_choice(self):
+        result = self.shell('''
+is_root() { :; }
+detect_system() { OS_ID=debian; }
+traffic_update_components() { :; }
+show_status() { echo SECOND_ACTION_SHOULD_NOT_RUN; }
+STREAM_DIR=$TRAFFIC_DIR/rules
+mkdir -p "$STREAM_DIR"
+printf 'server {\n    proxy_pass 1.2.3.4:443;\n}\n' >"$STREAM_DIR/10000.conf"
+menu
+echo SHELL_RETURNED
+''', '5\n7\n')
+        self.assertIn('1.2.3.4:443', result.stdout)
+        self.assertEqual(result.stdout.count('Nginx 端口转发一键脚本'), 1)
+        self.assertNotIn('SECOND_ACTION_SHOULD_NOT_RUN', result.stdout)
+        self.assertTrue(result.stdout.rstrip().endswith('SHELL_RETURNED'))
+
+    def test_traffic_exit_returns_to_shell_without_reprinting_main_menu(self):
+        self.init(limit=500*GB, used=0)
+        result = self.shell('''
+is_root() { :; }
+detect_system() { OS_ID=debian; }
+traffic_update_components() { :; }
+require_installed() { :; }
+show_status() { echo SECOND_ACTION_SHOULD_NOT_RUN; }
+menu
+echo SHELL_RETURNED
+''', '6\n0\n7\n')
+        self.assertEqual(result.stdout.count('Nginx 端口转发一键脚本'), 1)
+        self.assertEqual(result.stdout.count('—————— 流量统计 ——————'), 1)
+        self.assertNotIn('返回主菜单', result.stdout)
+        self.assertNotIn('SECOND_ACTION_SHOULD_NOT_RUN', result.stdout)
+        self.assertTrue(result.stdout.rstrip().endswith('SHELL_RETURNED'))
+        self.assertTrue(self.active())
 
     def test_reload_respects_quota_and_does_not_restart_nginx(self):
         self.init(used=GB)
@@ -438,7 +677,7 @@ traffic_menu
         self.assertIn('已用流量：150.00 GB', result.stdout)
         self.assertTrue((self.root/'systemd/nginx.service.d/traffic.conf').exists())
         self.assertTrue((self.root/'installed/traffic-guard.sh').stat().st_mode & 0o111)
-        self.assertEqual((self.state_dir/'component-version').read_text().strip(), '1.0.4')
+        self.assertEqual((self.state_dir/'component-version').read_text().strip(), '1.0.5')
 
     def test_first_setup_zero_limit_means_one_gb(self):
         self.shell('''
